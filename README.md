@@ -65,15 +65,16 @@ jobs chan Job  // Buffered channel to queue jobs
 
 **What it is**: A way to pass cancellation signals and deadlines across goroutines.
 
-**Why I used it**: To gracefully shut down all workers when the pool closes.
+**Why I used it**: To gracefully shut down all workers when the pool closes, and implement per-job timeouts.
 
 **How I used it**:
 
 ```go
 ctx, cancel := context.WithCancel(ctx)
+context.WithTimeout(ctx, timeout)  // Per-attempt timeout
 ```
 
-When `Shutdown()` is called, `cancel()` signals all workers to stop.
+Jobs can timeout independently, and pool context cancels all workers on shutdown.
 
 ---
 
@@ -93,19 +94,21 @@ wg.Wait()     // In Shutdown() - blocks until all workers are done
 
 ---
 
-### 5. **sync.Once** - Single Execution
+### 5. **Atomic Operations** - Lock-free Concurrency
 
-**What it is**: Ensures a function runs exactly once, even if called multiple times.
+**What it is**: `atomic` package provides thread-safe operations on shared variables without explicit locks.
 
-**Why I used it**: To prevent multiple shutdown attempts that could cause errors.
+**Why I used it**: To safely update metrics counters from multiple goroutines without mutex overhead.
 
 **How I used it**:
 
 ```go
-once.Do(func() {
-    // Shutdown logic runs only once
-})
+atomic.AddUint64(&p.metrics.submitted, 1)
+atomic.LoadInt32(&p.closed)
+atomic.CompareAndSwapInt32(&p.closed, 0, 1)
 ```
+
+Atomics are faster than mutexes for simple counters; `CompareAndSwap` implements idempotent shutdown.
 
 ---
 
@@ -113,16 +116,16 @@ once.Do(func() {
 
 **What it is**: Waits on multiple channel operations and executes the first one that's ready.
 
-**Why I used it**: To make workers respond to either new jobs or shutdown signals, and handle timeouts during retries.
+**Why I used it**: To handle job submissions, shutdown signals, and context cancellations simultaneously.
 
 **How I used it**:
 
 ```go
 select {
-case <-p.ctx.Done():    // Shutdown signal
-    return
-case job, ok := <-p.jobs:  // New job
-    job(p.ctx)
+case job := <-p.jobs:        // New job available
+    p.runJob(job)
+case <-p.quit:               // Shutdown signal
+    p.drainJobs()
 }
 ```
 
@@ -132,19 +135,17 @@ case job, ok := <-p.jobs:  // New job
 
 **What it is**: `defer` ensures code runs even if a function panics. `recover()` catches panics.
 
-**Why I used it**: To prevent a single job crash from killing an entire worker goroutine.
+**Why I used it**: To prevent a single job crash from killing a worker goroutine.
 
 **How I used it**:
 
 ```go
 defer func() {
     if r := recover(); r != nil {
-        log.Println("worker recovered from panic:", r)
+        err = &panicError{value: r}
     }
 }()
 ```
-
-Now if a job panics, the worker logs the error and continues processing other jobs instead of crashing.
 
 ---
 
@@ -157,30 +158,76 @@ Now if a job panics, the worker logs the error and continues processing other jo
 **How I used it**:
 
 ```go
+maxAttempts := job.Retries + 1  // Retries=3 means 4 total attempts
+backoff := time.Duration(attempt+1) * 100 * time.Millisecond
+```
+
+---
+
+### 9. **Per-Job Timeout** - Deadline Enforcement
+
+**What it is**: Set a maximum execution time for individual job attempts.
+
+**Why I used it**: Prevent jobs from hanging indefinitely and blocking workers.
+
+**How I used it**:
+
+```go
 type Job struct {
     Execute func(ctx context.Context) error
     Retries int
-    Timeout time.Duration
+    Timeout time.Duration  // Timeout per attempt
 }
 
-// In runJob():
-for attempt := 0; attempt <= job.Retries; attempt++ {
-    err = job.Execute(ctx)
-
-    if err == nil {
-        return
-    }
-
-    backoff := time.Duration(attempt+1) * 100 * time.Millisecond
-    // wait before retrying
-}
+attemptCtx, cancel := context.WithTimeout(p.ctx, job.Timeout)
 ```
 
-Job structure now includes:
+Jobs that exceed their timeout fail with `context.DeadlineExceeded`.
 
-- `Execute`: The actual work function that returns an error
-- `Retries`: Number of retry attempts if job fails
-- `Timeout`: Optional timeout for the job
+---
+
+### 10. **Pool Metrics & Observability** - Production Readiness
+
+**What it is**: Collect statistics about pool operations (submitted, succeeded, failed, retried, etc.).
+
+**Why I used it**: Monitor pool health and job success rates in production.
+
+**How I used it**:
+
+```go
+type PoolMetrics struct {
+    Submitted uint64  // Total jobs submitted
+    Started   uint64  // Jobs that began execution
+    Succeeded uint64  // Successful completions
+    Failed    uint64  // Total failures
+    Retried   uint64  // Retry attempts made
+    TimedOut  uint64  // Failures due to timeout
+    Panicked  uint64  // Failures due to panic
+}
+
+metrics := pool.Metrics()
+```
+
+Thread-safe snapshot accessible anytime via `pool.Metrics()`.
+
+---
+
+### 11. **Graceful Shutdown with Job Draining** - Clean Termination
+
+**What it is**: Stop accepting new jobs but complete queued jobs before exiting.
+
+**Why I used it**: Ensure no work is lost during shutdown; in-flight jobs complete normally.
+
+**How I used it**:
+
+```go
+close(p.quit)      // Signal shutdown
+p.drainJobs()      // Process remaining queue
+p.wg.Wait()        // Wait for workers to finish
+p.cancel()         // Cancel context after workers done
+```
+
+Job draining prevents data loss; workers exit only after queue is empty.
 
 ---
 
