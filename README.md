@@ -113,7 +113,7 @@ once.Do(func() {
 
 **What it is**: Waits on multiple channel operations and executes the first one that's ready.
 
-**Why I used it**: To make workers respond to either new jobs or shutdown signals.
+**Why I used it**: To make workers respond to either new jobs or shutdown signals, and handle timeouts during retries.
 
 **How I used it**:
 
@@ -125,6 +125,62 @@ case job, ok := <-p.jobs:  // New job
     job(p.ctx)
 }
 ```
+
+---
+
+### 7. **Defer & Panic Recovery** - Fault Tolerance
+
+**What it is**: `defer` ensures code runs even if a function panics. `recover()` catches panics.
+
+**Why I used it**: To prevent a single job crash from killing an entire worker goroutine.
+
+**How I used it**:
+
+```go
+defer func() {
+    if r := recover(); r != nil {
+        log.Println("worker recovered from panic:", r)
+    }
+}()
+```
+
+Now if a job panics, the worker logs the error and continues processing other jobs instead of crashing.
+
+---
+
+### 8. **Retry Mechanism with Exponential Backoff** - Resilience
+
+**What it is**: Automatically retry failed jobs with increasing delays between attempts.
+
+**Why I used it**: Network and transient failures are common; retrying improves reliability.
+
+**How I used it**:
+
+```go
+type Job struct {
+    Execute func(ctx context.Context) error
+    Retries int
+    Timeout time.Duration
+}
+
+// In runJob():
+for attempt := 0; attempt <= job.Retries; attempt++ {
+    err = job.Execute(ctx)
+
+    if err == nil {
+        return
+    }
+
+    backoff := time.Duration(attempt+1) * 100 * time.Millisecond
+    // wait before retrying
+}
+```
+
+Job structure now includes:
+
+- `Execute`: The actual work function that returns an error
+- `Retries`: Number of retry attempts if job fails
+- `Timeout`: Optional timeout for the job
 
 ---
 
