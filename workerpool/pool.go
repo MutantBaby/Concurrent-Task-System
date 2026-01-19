@@ -19,7 +19,7 @@ var (
 // Job represents a unit of work to be executed by the pool.
 type Job struct {
 	Execute func(ctx context.Context) error
-	Retries int           // Number of retry attempts (0 = no retries, 3 = 1 initial + 3 retries = 4 total attempts)
+	Retries int
 	Timeout time.Duration // Timeout per attempt (0 = no timeout)
 }
 
@@ -49,24 +49,20 @@ type metrics struct {
 // Pool manages a fixed number of worker goroutines processing jobs from a queue.
 type Pool struct {
 	maxWorkers int
+	closed     int32 // Atomic flag: 0 = open, 1 = closed
 	metrics    metrics
 	jobs       chan Job
-
-	wg     sync.WaitGroup
-	quit   chan struct{} // Closed to signal shutdown
-	closed int32         // Atomic flag: 0 = open, 1 = closed
-
-	ctx    context.Context
-	cancel context.CancelFunc
+	quit       chan struct{} // Closed to signal shutdown
+	wg         sync.WaitGroup
+	ctx        context.Context
+	cancel     context.CancelFunc
 }
 
-// New creates and starts a new worker pool.
-// maxWorkers: number of concurrent workers (must be > 0)
-// queueSize: buffered channel size for pending jobs
 func New(ctx context.Context, maxWorkers, queueSize int) *Pool {
 	if maxWorkers <= 0 {
 		panic("maxWorkers must be > 0")
 	}
+
 	if queueSize < 0 {
 		panic("queueSize cannot be negative")
 	}
@@ -117,7 +113,6 @@ func (p *Pool) drainJobs() {
 		case job := <-p.jobs:
 			p.runJob(job)
 		default:
-			// Queue is empty
 			return
 		}
 	}
@@ -141,12 +136,12 @@ func (p *Pool) Submit(job Job) error {
 		atomic.AddUint64(&p.metrics.submitted, 1)
 		return nil
 
+	// Shutdown happened while we were blocked
 	case <-p.quit:
-		// Shutdown happened while we were blocked
 		return ErrPoolClosed
 
+	// Parent context cancelled
 	case <-p.ctx.Done():
-		// Parent context cancelled
 		return fmt.Errorf("context canceled: %w", p.ctx.Err())
 	}
 }
